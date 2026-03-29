@@ -81,7 +81,8 @@ class MagiPipeline:
         sr_mode=False,
         steps=50,
         sr_steps=50,
-        offload=False
+        offload=False,
+        offload_block_num=1,
 
 
     ):
@@ -109,6 +110,7 @@ class MagiPipeline:
                 conds=conds,
                 offload=offload,
                 is_distill=self.is_distill,
+                offload_block_num=offload_block_num,
             )
 
         # if output_width is not None and output_height is not None:
