@@ -30,56 +30,155 @@ from torch.nn import Parameter
 import copy
 
 class BlockGPUManager:
-    def __init__(self, device="cuda", block_group_size=1):
+    def __init__(self, device="cuda", block_group_size=2):
         self.device = torch.device(device)
-        self.managed_modules = [] 
-        self.submodule = []    
-        self.block_group_size = block_group_size
+        self.managed_modules = []
+        self.submodule = []
+        self.block_group_size = block_group_size  # 每次加载的连续层数
         self._original_model_ref = None
         self._original_layers_ref = None
-        
+        self._num_groups = 0  # 总批次数
+        self._current_group = -1  # 当前正在计算的批次索引
+        self._prefetched_group = -1  # 预取中的批次索引
+        self._group_loaded: list[bool] = []
+        self._group_ready_events: list[Optional[torch.cuda.Event]] = []
+        self._prefetch_stream: Optional[torch.cuda.Stream] = None
+        self._parameter_pinned = False  # 只需 pin memory 一次
 
     def setup_for_inference(self, transformer_model):
         self._collect_managed_modules(transformer_model)
         self._initialize_submodule()
+        self._create_prefetch_stream()
         return self
-    
+
+    def _create_prefetch_stream(self):
+        if self.device.type == "cuda":
+            self._prefetch_stream = torch.cuda.Stream(device=self.device)
+        else:
+            self._prefetch_stream = None
+
     def _collect_managed_modules(self, transformer_model):
         self.submodule = []
         self._original_model_ref = transformer_model
         self._original_layers_ref = transformer_model.block.layers
-    
+        self._num_groups = (len(self._original_layers_ref) + self.block_group_size - 1) // self.block_group_size
+        print(f"Total number of layers: {len(self._original_layers_ref)}")
+        print(f"Total number of groups: {self._num_groups}")
+
+        # pin memory only for CPU path; if weights are already on GPU, move them back first.
+        if self.device.type == "cuda" and not self._parameter_pinned:
+            for layer in self._original_layers_ref:
+                if any(p.is_cuda for p in layer.parameters()):
+                    layer.to("cpu")
+                for p in layer.parameters():
+                    if not p.is_pinned():
+                        p.pin_memory()
+                for b in layer.buffers():
+                    if not b.is_pinned():
+                        b.pin_memory()
+            self._parameter_pinned = True
+
         for attr in ['adapter', 'final_norm_video', 'final_norm_audio', 
                      'final_linear_video', 'final_linear_audio']:
             if hasattr(transformer_model, attr):
                 self.submodule.append(getattr(transformer_model, attr))
 
-        self.managed_modules = [None] * len(self._original_layers_ref)
+        self.managed_modules = [None] * self._num_groups
+        self._group_loaded = [False] * self._num_groups
+        self._group_ready_events = [None] * self._num_groups
 
     def _get_layer(self, layer_index):
-        """按需获取层，避免一次性加载所有层"""
-        if self.managed_modules[layer_index] is None:
-            #self.managed_modules[layer_index] = self._original_layers_ref[layer_index]
-            self.managed_modules[layer_index] = copy.deepcopy(self._original_layers_ref[layer_index])
-            self.managed_modules[layer_index].to(self.device)
-        return self.managed_modules[layer_index]
+        """按需获取批次中的层，实现双缓冲预取"""
+        group_index = layer_index // self.block_group_size
+        local_idx = layer_index % self.block_group_size
 
+        if not self._group_loaded[group_index]:
+            self._prefetch_group(group_index)
+        self._wait_group_ready(group_index)
+
+        next_group = group_index + 1
+        if next_group < self._num_groups and not self._group_loaded[next_group]:
+            self._prefetch_group(next_group)
+
+        self._unload_unused_groups(keep={group_index, next_group})
+        self._current_group = group_index
+
+        return self.managed_modules[group_index][local_idx]
+
+    def _prefetch_group(self, group_index):
+        if self._group_loaded[group_index]:
+            return
+
+        start_idx = group_index * self.block_group_size
+        end_idx = min(start_idx + self.block_group_size, len(self._original_layers_ref))
+
+        group = nn.ModuleList()
+        if self._prefetch_stream is not None:
+            with torch.cuda.stream(self._prefetch_stream):
+                for layer in self._original_layers_ref[start_idx:end_idx]:
+                    cpu_layer = copy.deepcopy(layer)
+                    cpu_layer.to(self.device, non_blocking=True)
+                    group.append(cpu_layer)
+                event = torch.cuda.Event()
+                event.record(self._prefetch_stream)
+            self._group_ready_events[group_index] = event
+        else:
+            for layer in self._original_layers_ref[start_idx:end_idx]:
+                cpu_layer = copy.deepcopy(layer)
+                cpu_layer.to(self.device)
+                group.append(cpu_layer)
+            self._group_ready_events[group_index] = None
+
+        self.managed_modules[group_index] = group
+        self._group_loaded[group_index] = True
+        self._prefetched_group = group_index
+
+    def _wait_group_ready(self, group_index):
+        event = self._group_ready_events[group_index]
+        if event is not None:
+            torch.cuda.current_stream(self.device).wait_event(event)
+            self._group_ready_events[group_index] = None
+
+    def _unload_unused_groups(self, keep: set[int]):
+        for index in range(self._num_groups):
+            if self._group_loaded[index] and index not in keep:
+                self._unload_group(index)
+
+    def _unload_group(self, group_index):
+        if not self._group_loaded[group_index]:
+            return
+
+        group = self.managed_modules[group_index]
+        self.managed_modules[group_index] = None
+        self._group_loaded[group_index] = False
+        self._group_ready_events[group_index] = None
+        if self._current_group == group_index:
+            self._current_group = -1
+        if self._prefetched_group == group_index:
+            self._prefetched_group = -1
+        
+        group = None
+        del group
+        torch.cuda.empty_cache()
+        gc.collect()
 
     def _initialize_submodule(self):
         for module in self.submodule:
             if hasattr(module, 'to'):
                 module.to(self.device)
         return self
-    
+
     def unload_all_blocks_to_cpu(self):
-        for  module in self.managed_modules:
-            if hasattr(module, 'to'):
-                module.to('cpu')
+        # 卸载所有批次
+        for group_index in range(self._num_groups):
+            self._unload_group(group_index)
+        self._current_group = -1
+        self._prefetched_group = -1
         
         # 将embedder和output模块移到CPU
         for module in self.submodule:
             if hasattr(module, 'to'):
-                module.to('cpu', non_blocking=True)
+                module.to('cpu')
         torch.cuda.empty_cache()
         return self
 
@@ -910,13 +1009,10 @@ class TransformerBlock(torch.nn.Module):
         gpu_manager=None,
     ) -> torch.Tensor:
         for layer_index in range(len(self.layers)):
-            if gpu_manager is not None and layer_index < len(gpu_manager.managed_modules):
+            #if gpu_manager is not None and layer_index < len(gpu_manager.managed_modules):
+            if gpu_manager is not None:
                 layer = gpu_manager._get_layer(layer_index)
-                if layer_index > 0 and (layer_index - 1) < len(gpu_manager.managed_modules):
-                    prev_layer = gpu_manager.managed_modules[layer_index - 1]
-                    if prev_layer is not None and hasattr(prev_layer, 'to'):
-                        prev_layer.to('cpu')
-                        gpu_manager.managed_modules[layer_index - 1] = None# 清空引用，释放内存
+                #gpu_manager._pass_layer(layer_index)
             else:
                 layer = self.layers[layer_index]
             
