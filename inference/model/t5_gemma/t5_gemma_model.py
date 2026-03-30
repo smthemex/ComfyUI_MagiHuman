@@ -24,7 +24,7 @@ class T5GemmaEncoder:
         self.gguf_mode=False    
         if model_path is not None:
             if os.path.isfile(model_path):
-                configs=T5GemmaConfig.from_pretrained(repo,is_encoder_decoder=False,model_type=weight_dtype,)
+                configs=T5GemmaConfig.from_pretrained(repo,is_encoder_decoder=False,model_type=weight_dtype,ignore_mismatched_sizes=True,low_cpu_mem_usage=False)
                 with ctx():
                     model = T5GemmaEncoderModel(configs)
                 model_dict=load_file(model_path)
@@ -43,7 +43,7 @@ class T5GemmaEncoder:
                 )
             self.model = CPUOffloadWrapper(model, is_cpu_offload=env_is_true("CPU_OFFLOAD") or get_arch_memory() <= 48)
         elif gguf_path is not None:
-            configs=T5GemmaConfig.from_pretrained(repo,is_encoder_decoder=False,model_type=weight_dtype,)
+            configs=T5GemmaConfig.from_pretrained(repo,is_encoder_decoder=False,model_type=weight_dtype,ignore_mismatched_sizes=True,low_cpu_mem_usage=False)
             with ctx():
                 self.model = T5GemmaEncoderModel(configs)
             g_dict=load_gguf_checkpoint(gguf_path)
